@@ -7,7 +7,7 @@ Created on Mon May 22 13:36:25 2017
 
 import tensorflow as tf
 
-from GPflow._settings import settings
+from gpflow._settings import settings
 jitter = settings.numerics.jitter_level
 float_type = settings.dtypes.float_type
 

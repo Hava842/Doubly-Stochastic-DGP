@@ -80,7 +80,6 @@ class GPNetwork(object):
 
         layer_energies = [l.getEnergyContribution() for l in self.layers]
         self.energy = tf.add_n(layer_energies)
-#        self.energy = tf.Print(tf.add_n(layer_energies), [l for l in layer_energies])
         
         self.learning_rate = tf.Variable(0.01, trainable=False, dtype=tf.float32)
         adam = tf.train.AdamOptimizer(self.learning_rate)

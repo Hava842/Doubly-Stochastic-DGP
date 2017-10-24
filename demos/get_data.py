@@ -21,11 +21,10 @@ def download(name, data_path=data_path):
     if not os.path.isdir(data_path):
         os.makedirs(data_path)
     #print 'Downloading file: {}'.format(name)
-    download_url = 'https://hrs13publicdata.blob.core.windows.net/publicdata/'
+    download_url = 'https://archive.ics.uci.edu/ml/machine-learning-databases/housing/housing.data'
     s1 = 'cd {}'.format(data_path)
-    s2 = 'sudo wget {}{}.gz'.format(download_url, name)
-    s3 = 'sudo gzip -d {}.gz'.format(name)
-    s = '{}\n{}\n{}\n'.format(s1, s2, s3)
+    s2 = 'wget {}'.format(download_url)
+    s = '{}\n{}\n'.format(s1, s2)
     proc = Popen(s, shell=True)
     proc.wait()
     assert os.path.isfile(data_path + name), 'something went wrong downloading'
@@ -68,10 +67,13 @@ def get_mnist_data(data_path=data_path):
 def get_regression_data(name, split, data_path=data_path):
     path = '{}{}.csv'.format(data_path, name)
 
-    if not os.path.isfile(path):
-        download(name +'.csv', data_path=data_path)
+    if (name == 'housing.data'):
+        data = np.loadtxt(data_path + name)
+    else:
+        if not os.path.isfile(path):
+            download(name +'.csv', data_path=data_path)
         
-    data = pandas.read_csv(path, header=None).values
+        data = pandas.read_csv(path, header=None).values
 
     if name in ['energy', 'naval']:
         # there are two Ys for these, but take only the first

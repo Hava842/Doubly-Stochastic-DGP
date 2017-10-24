@@ -7,47 +7,71 @@ Created on Tue May 16 13:35:36 2017
 
 import tensorflow as tf
 import numpy as np
+from scipy.cluster.vq import kmeans2
 
-from GPflow.param import Param, ParamList, Parameterized, AutoFlow, DataHolder
-from GPflow.minibatch import MinibatchData
-from GPflow.conditionals import conditional
-from GPflow.model import Model
-from GPflow.mean_functions import Linear, Zero
-from GPflow.kullback_leiblers import gauss_kl_white
-from GPflow._settings import settings
+from gpflow.param import Param, ParamList, Parameterized, AutoFlow, DataHolder
+from gpflow.minibatch import MinibatchData
+from gpflow.conditionals import conditional
+from gpflow.model import Model
+from gpflow.mean_functions import Linear, Zero
+from gpflow.likelihoods import Gaussian
+from gpflow.kernels import RBF, White
+from gpflow.kullback_leiblers import gauss_kl_white
+from gpflow._settings import settings
 
 float_type = settings.dtypes.float_type
 
-from .utils import normal_sample, shape_as_list, tile_over_samples
+from utils import normal_sample, shape_as_list, tile_over_samples
 
-class Layer(Parameterized):
-    def __init__(self, kern, q_mu, q_sqrt, Z, mean_function):
+class Node(Parameterized):
+    def __init__(self, kern, q_mu, q_sqrt, Z):
         Parameterized.__init__(self)
-        self.q_mu, self.q_sqrt, self.Z = Param(q_mu), Param(q_sqrt), Param(Z)
+        self.q_mu, self.q_sqrt, self.Z = Param(q_mu), Param(q_sqrt), Param(Z.copy())
         self.kern = kern
-        self.mean_function = mean_function
         
     def conditional(self, X, full_cov=False):
         mean, var = conditional(X, self.Z, self.kern,
                                 self.q_mu, q_sqrt=self.q_sqrt,
                                 full_cov=full_cov, whiten=True)
-        return mean + self.mean_function(X), var
         
-    def multisample_conditional(self, X, full_cov=False):
-        f = lambda a: self.conditional(a, full_cov=full_cov)
-        mean, var = tf.map_fn(f, X, dtype=(tf.float64, tf.float64))
-        return tf.stack(mean), tf.stack(var)
+        return mean, var
         
     def KL(self):
         return gauss_kl_white(self.q_mu, self.q_sqrt)
 
-
-def init_layers(X, Z, dims, final_mean_function):
-    M = Z.shape[0]
-    q_mus, q_sqrts, mean_functions, Zs = [], [], [], []
-    X_running, Z_running = X.copy(), Z.copy()
+class Layer(Parameterized):
+    def __init__(self, kern, q_mu, q_sqrt, Z, mean_function):
+        Parameterized.__init__(self)
+        nodes = []
+        for n_kern, n_q_mu, n_q_s in zip(kern, q_mu, q_sqrt):
+            nodes.append(Node(n_kern, n_q_mu, n_q_s, Z))
+        self.nodes = ParamList(nodes)
+        self.mean_function = mean_function
     
-    for dim_in, dim_out in zip(dims[:-2], dims[1:-1]):
+    def conditional(self, X, full_cov=False):
+        mv_list = [(n.conditional(X, full_cov)) for n in self.nodes]
+        mean = tf.concat([m for m, v in mv_list], axis=1)
+        var = tf.concat([v for m, v in mv_list], axis=1)
+        return mean + self.mean_function(X), var
+    
+    def multisample_conditional(self, X, full_cov=False):
+        f = lambda a: self.conditional(a, full_cov=full_cov)
+        mean, var = tf.map_fn(f, X, dtype=(tf.float64, tf.float64))
+        
+        return tf.stack(mean), tf.stack(var)
+        
+    def KL(self):
+        all_mu = tf.concat([n.q_mu for n in self.nodes], 1)
+        all_sqrt = tf.concat([n.q_sqrt for n in self.nodes], 2)
+        return gauss_kl_white(all_mu, all_sqrt)
+        
+def init_layers(X, dims_in, dims_out,
+                M, final_inducing_points,
+                share_inducing_inputs):
+    q_mus, q_sqrts, mean_functions, Zs = [], [], [], []
+    X_running = X.copy()
+    
+    for dim_in, dim_out in zip(dims_in[:-1], dims_out[:-1]):
         if dim_in == dim_out: # identity for same dims
             W = np.eye(dim_in)
         elif dim_in > dim_out: # use PCA mf for stepping down
@@ -55,45 +79,66 @@ def init_layers(X, Z, dims, final_mean_function):
             W = V[:dim_out, :].T
         elif dim_in < dim_out: # identity + pad with zeros for stepping up
             I = np.eye(dim_in)
-            zeros = np.zeros((dim_in, dim_out - dim_in))
-            W = np.concatenate([I, zeros], 1)
+            zeros = np.zeros((dim_out - dim_in, dim_in))
+            W = np.concatenate([I, zeros], 0).T
 
         mean_functions.append(Linear(A=W))
-        Zs.append(Z_running.copy())
-        q_mus.append(np.zeros((M, dim_out)))
-        q_sqrts.append(np.eye(M)[:, :, None] * np.ones((1, 1, dim_out)))
-        
-        Z_running = Z_running.dot(W)
+        Zs.append(kmeans2(X_running, M, minit='points')[0])
+        if share_inducing_inputs:
+            q_mus.append([np.zeros((M, dim_out))])
+            q_sqrts.append([np.eye(M)[:, :, None] * np.ones((1, 1, dim_out))])
+        else:
+            q_mus.append([np.zeros((M, 1))] * dim_out)
+            q_sqrts.append([np.eye(M)[:, :, None] * np.ones((1, 1, 1))] * dim_out)
+         
         X_running = X_running.dot(W)
 
     # final layer (as before but no mean function)
-    mean_functions.append(final_mean_function)
-    Zs.append(Z_running.copy())
-    q_mus.append(np.zeros((M, dims[-1])))
-    q_sqrts.append(np.eye(M)[:, :, None] * np.ones((1, 1, dims[-1])))
+    mean_functions.append(Zero())
+    Zs.append(kmeans2(X_running, final_inducing_points, minit='points')[0])
+    q_mus.append([np.zeros((final_inducing_points, 1))])
+    q_sqrts.append([np.eye(final_inducing_points)[:, :, None] * np.ones((1, 1, 1))])
 
     return q_mus, q_sqrts, Zs, mean_functions
 
 
 class DGP(Model):
-    def __init__(self, X, Y, Z, kernels, likelihood, 
-                 num_latent_Y=None, 
-                 minibatch_size=None, 
-                 num_samples=1,
-                 mean_function=Zero()):
+    def __init__(self, X, Y,
+                 inducing_points,
+                 final_inducing_points,
+                 hidden_units,
+                 units,
+                 share_inducing_inputs=True):
         Model.__init__(self)
 
         assert X.shape[0] == Y.shape[0]
-        assert Z.shape[1] == X.shape[1]
-        assert kernels[0].input_dim == X.shape[1]
-
+        
         self.num_data, D_X = X.shape
-        self.num_samples = num_samples
-        self.D_Y = num_latent_Y or Y.shape[1]
+        self.D_Y = 1
+        self.num_samples = 100
+        
+        kernels = []
+        for l in range(hidden_units+1):
+            ks = []
+            if (l > 0):
+                D = units
+            else:
+                D = D_X
+            if (l < hidden_units):
+                for w in range(units):
+                    ks.append(RBF(D, lengthscales=1., variance=1.) + White(D, variance=1e-5))
+            else:
+                ks.append(RBF(D, lengthscales=1., variance=1.))
+            kernels.append(ks)                
 
-        self.dims = [k.input_dim for k in kernels] + [self.D_Y, ]
-        q_mus, q_sqrts, Zs, mean_functions = init_layers(X, Z, self.dims, 
-                                                         mean_function)
+        self.dims_in = [D_X] + [units] * hidden_units
+        self.dims_out = [units] * hidden_units + [1]
+        q_mus, q_sqrts, Zs, mean_functions = init_layers(X,
+                                                         self.dims_in,
+                                                         self.dims_out,
+                                                         inducing_points,
+                                                         final_inducing_points,
+                                                         share_inducing_inputs)
                                                          
         layers = []
         for q_mu, q_sqrt, Z, mean_function, kernel in zip(q_mus, q_sqrts, Zs, 
@@ -105,8 +150,9 @@ class DGP(Model):
         for layer in self.layers[:-1]: # fix the inner layer mean functions 
             layer.mean_function.fixed = True
             
-        self.likelihood = likelihood
+        self.likelihood = Gaussian()
         
+        minibatch_size = 10000 if X.shape[0] > 10000 else None 
         if minibatch_size is not None:
             self.X = MinibatchData(X, minibatch_size)
             self.Y = MinibatchData(Y, minibatch_size)
@@ -134,7 +180,6 @@ class DGP(Model):
     
     def build_likelihood(self):
         Fmean, Fvar = self.build_predict(self.X, full_cov=False, S=self.num_samples)
-
         S, N, D = shape_as_list(Fmean)
         Y = tile_over_samples(self.Y, self.num_samples)
         
